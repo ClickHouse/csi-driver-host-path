@@ -251,7 +251,7 @@ for i in $(ls ${BASE_DIR}/hostpath/*.yaml | sort); do
 done
 
 wait_for_daemonset () {
-    retries=10
+    retries=20
     while [ $retries -ge 0 ]; do
         ready=$(kubectl get -n $1 daemonset $2 -o jsonpath="{.status.numberReady}")
         required=$(kubectl get -n $1 daemonset $2 -o jsonpath="{.status.desiredNumberScheduled}")
@@ -259,7 +259,7 @@ wait_for_daemonset () {
             return 0
         fi
         retries=$((retries - 1))
-        sleep 3
+        sleep 5
     done
     return 1
 }
