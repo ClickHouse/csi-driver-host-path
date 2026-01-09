@@ -25,14 +25,13 @@ import (
 	"path"
 	"syscall"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-host-path/internal/proxy"
 	"github.com/kubernetes-csi/csi-driver-host-path/pkg/hostpath"
+	"github.com/kubernetes-csi/csi-lib-utils/standardflags"
 )
-
-func init() {
-	flag.Set("logtostderr", "true")
-}
 
 var (
 	// Set by the build process
@@ -58,8 +57,13 @@ func main() {
 	flag.BoolVar(&cfg.EnableVolumeExpansion, "node-expand-required", true, "Enables volume expansion capability of the plugin(Deprecated). Please use enable-volume-expansion flag.")
 
 	flag.BoolVar(&cfg.EnableVolumeExpansion, "enable-volume-expansion", true, "Enables volume expansion feature.")
+	flag.BoolVar(&cfg.EnableControllerModifyVolume, "enable-controller-modify-volume", false, "Enables Controller modify volume feature.")
+	flag.BoolVar(&cfg.EnableSnapshotMetadata, "enable-snapshot-metadata", false, "Enables Snapshot Metadata service.")
+	snapshotMetadataBlockType := flag.String("snapshot-metadata-block-type", "FIXED_LENGTH", "Expected Snapshot Metadata block type in response. Allowed valid types are FIXED_LENGTH or VARIABLE_LENGTH. If not specified, FIXED_LENGTH is used by default.")
+	flag.Var(&cfg.AcceptedMutableParameterNames, "accepted-mutable-parameter-names", "Comma separated list of parameter names that can be modified on a persistent volume. This is only used when enable-controller-modify-volume is true. If unset, all parameters are mutable.")
 	flag.BoolVar(&cfg.DisableControllerExpansion, "disable-controller-expansion", false, "Disables Controller volume expansion capability.")
 	flag.BoolVar(&cfg.DisableNodeExpansion, "disable-node-expansion", false, "Disables Node volume expansion capability.")
+	flag.BoolVar(&cfg.EnableListSnapshots, "enable-list-snapshots", true, "Enables ControllerServiceCapability_RPC_LIST_SNAPSHOTS capability. Defaults to true.")
 	flag.Int64Var(&cfg.MaxVolumeExpansionSizeNode, "max-volume-size-node", 0, "Maximum allowed size of volume when expanded on the node. Defaults to same size as max-volume-size.")
 
 	flag.Int64Var(&cfg.AttachLimit, "attach-limit", 0, "Maximum number of attachable volumes on a node. Zero refers to no limit.")
@@ -68,6 +72,12 @@ func main() {
 	// for proxying incoming calls to the embedded mock CSI driver.
 	proxyEndpoint := flag.String("proxy-endpoint", "", "Instead of running the CSI driver code, just proxy connections from csiEndpoint to the given listening socket.")
 
+	standardflags.AddAutomaxprocs(func(format string, args ...any) {
+		// wrapping fmt.Printf and ignoring its return values
+		fmt.Printf(format, args...)
+	})
+
+	klog.InitFlags(nil)
 	flag.Parse()
 
 	if *showVersion {
@@ -85,7 +95,7 @@ func main() {
 		defer cancel()
 		closer, err := proxy.Run(ctx, cfg.Endpoint, *proxyEndpoint)
 		if err != nil {
-			glog.Fatalf("failed to run proxy: %v", err)
+			klog.Fatalf("failed to run proxy: %v", err)
 		}
 		defer closer.Close()
 
@@ -106,6 +116,14 @@ func main() {
 	if cfg.MaxVolumeExpansionSizeNode == 0 {
 		cfg.MaxVolumeExpansionSizeNode = cfg.MaxVolumeSize
 	}
+
+	// validate snapshot-metadata-type arg block type
+	bt, ok := csi.BlockMetadataType_value[*snapshotMetadataBlockType]
+	if !ok {
+		fmt.Printf("invalid snapshot-metadata-block-type passed, please pass one of the - FIXED_LENGTH, VARIABLE_LENGTH")
+		os.Exit(1)
+	}
+	cfg.SnapshotMetadataBlockType = csi.BlockMetadataType(bt)
 
 	driver, err := hostpath.NewHostPathDriver(cfg)
 	if err != nil {
