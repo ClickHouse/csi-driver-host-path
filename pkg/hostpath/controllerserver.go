@@ -23,18 +23,16 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/golang/protobuf/ptypes"
-
-	"github.com/golang/glog"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/pborman/uuid"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
-	utilexec "k8s.io/utils/exec"
 
 	"github.com/kubernetes-csi/csi-driver-host-path/pkg/state"
 )
@@ -45,8 +43,19 @@ const (
 
 func (hp *hostPath) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (resp *csi.CreateVolumeResponse, finalErr error) {
 	if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
-		glog.V(3).Infof("invalid create volume req: %v", req)
+		klog.V(3).Infof("invalid create volume req: %v", req)
 		return nil, err
+	}
+
+	if len(req.GetMutableParameters()) > 0 {
+		if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_MODIFY_VOLUME); err != nil {
+			klog.V(3).Infof("invalid create volume req: %v", req)
+			return nil, err
+		}
+		// Check if the mutable parameters are in the accepted list
+		if err := hp.validateVolumeMutableParameters(req.MutableParameters); err != nil {
+			return nil, err
+		}
 	}
 
 	// Check arguments
@@ -88,12 +97,23 @@ func (hp *hostPath) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 		requestedAccessType = state.MountAccess
 	}
 
+	capacity := int64(req.GetCapacityRange().GetRequiredBytes())
+	limit := int64(req.GetCapacityRange().GetLimitBytes())
+	if capacity < 0 || limit < 0 {
+		return nil, status.Error(codes.InvalidArgument, "cannot have negative capacity")
+	}
+	if limit > 0 && capacity > limit {
+		return nil, status.Error(codes.InvalidArgument, "capacity cannot exceed limit")
+	}
+	if capacity == 0 && limit > 0 {
+		capacity = limit
+	}
+
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
 	hp.mutex.Lock()
 	defer hp.mutex.Unlock()
 
-	capacity := int64(req.GetCapacityRange().GetRequiredBytes())
 	topologies := []*csi.Topology{}
 	if hp.config.EnableTopology {
 		topologies = append(topologies, &csi.Topology{Segments: map[string]string{TopologyKeyNode: hp.config.NodeID}})
@@ -105,7 +125,7 @@ func (hp *hostPath) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 		// Since err is nil, it means the volume with the same name already exists
 		// need to check if the size of existing volume is the same as in new
 		// request
-		if exVol.VolSize < capacity {
+		if exVol.VolSize < capacity || (limit > 0 && exVol.VolSize > limit) {
 			return nil, status.Errorf(codes.AlreadyExists, "Volume with the same name: %s but with different size already exist", req.GetName())
 		}
 		if req.GetVolumeContentSource() != nil {
@@ -137,11 +157,13 @@ func (hp *hostPath) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 
 	volumeID := uuid.NewUUID().String()
 	kind := req.GetParameters()[storageKind]
+	// This code does not check whether hp.createVolume rounds capacity up;
+	// a more robust driver would ensure any rounding does not exceed limit.
 	vol, err := hp.createVolume(volumeID, req.GetName(), capacity, requestedAccessType, false /* ephemeral */, kind)
 	if err != nil {
 		return nil, err
 	}
-	glog.V(4).Infof("created volume %s at path %s", vol.VolID, vol.VolPath)
+	klog.V(4).Infof("created volume %s at path %s", vol.VolID, vol.VolPath)
 
 	if req.GetVolumeContentSource() != nil {
 		path := hp.getVolumePath(volumeID)
@@ -161,19 +183,19 @@ func (hp *hostPath) CreateVolume(ctx context.Context, req *csi.CreateVolumeReque
 			err = status.Errorf(codes.InvalidArgument, "%v not a proper volume source", volumeSource)
 		}
 		if err != nil {
-			glog.V(4).Infof("VolumeSource error: %v", err)
+			klog.V(4).Infof("VolumeSource error: %v", err)
 			if delErr := hp.deleteVolume(volumeID); delErr != nil {
-				glog.V(2).Infof("deleting hostpath volume %v failed: %v", volumeID, delErr)
+				klog.V(2).Infof("deleting hostpath volume %v failed: %v", volumeID, delErr)
 			}
 			return nil, err
 		}
-		glog.V(4).Infof("successfully populated volume %s", vol.VolID)
+		klog.V(4).Infof("successfully populated volume %s", vol.VolID)
 	}
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:           volumeID,
-			CapacityBytes:      req.GetCapacityRange().GetRequiredBytes(),
+			CapacityBytes:      capacity,
 			VolumeContext:      req.GetParameters(),
 			ContentSource:      req.GetVolumeContentSource(),
 			AccessibleTopology: topologies,
@@ -188,7 +210,7 @@ func (hp *hostPath) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeReque
 	}
 
 	if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
-		glog.V(3).Infof("invalid delete volume req: %v", req)
+		klog.V(3).Infof("invalid delete volume req: %v", req)
 		return nil, err
 	}
 
@@ -216,7 +238,7 @@ func (hp *hostPath) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeReque
 	if err := hp.deleteVolume(volId); err != nil {
 		return nil, fmt.Errorf("failed to delete volume %v: %w", volId, err)
 	}
-	glog.V(4).Infof("volume %v successfully deleted", volId)
+	klog.V(4).Infof("volume %v successfully deleted", volId)
 
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -387,11 +409,11 @@ func (hp *hostPath) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest
 
 	return &csi.GetCapacityResponse{
 		AvailableCapacity: available,
-		MaximumVolumeSize: &wrappers.Int64Value{Value: maxVolumeSize},
+		MaximumVolumeSize: &wrapperspb.Int64Value{Value: maxVolumeSize},
 
 		// We don't have a minimum volume size, so we might as well report that.
 		// Better explicit than implicit...
-		MinimumVolumeSize: &wrappers.Int64Value{Value: 0},
+		MinimumVolumeSize: &wrapperspb.Int64Value{Value: 0},
 	}, nil
 }
 
@@ -435,7 +457,7 @@ func (hp *hostPath) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest
 	for index := startIdx - 1; index < volumesLength && index < maxLength; index++ {
 		hpVolume = volumes[index]
 		healthy, msg := hp.doHealthCheckInControllerSide(hpVolume.VolID)
-		glog.V(3).Infof("Healthy state: %s Volume: %t", hpVolume.VolName, healthy)
+		klog.V(3).Infof("Healthy state: %s Volume: %t", hpVolume.VolName, healthy)
 		volumeRes.Entries = append(volumeRes.Entries, &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
 				VolumeId:      hpVolume.VolID,
@@ -451,7 +473,7 @@ func (hp *hostPath) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest
 		})
 	}
 
-	glog.V(5).Infof("Volumes are: %+v", *volumeRes)
+	klog.V(5).Infof("Volumes are: %+v", volumeRes)
 	return volumeRes, nil
 }
 
@@ -478,7 +500,7 @@ func (hp *hostPath) ControllerGetVolume(ctx context.Context, req *csi.Controller
 	}
 
 	healthy, msg := hp.doHealthCheckInControllerSide(req.GetVolumeId())
-	glog.V(3).Infof("Healthy state: %s Volume: %t", volume.VolName, healthy)
+	klog.V(3).Infof("Healthy state: %s Volume: %t", volume.VolName, healthy)
 	return &csi.ControllerGetVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      volume.VolID,
@@ -494,11 +516,43 @@ func (hp *hostPath) ControllerGetVolume(ctx context.Context, req *csi.Controller
 	}, nil
 }
 
+func (hp *hostPath) ControllerModifyVolume(ctx context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
+	if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_MODIFY_VOLUME); err != nil {
+		return nil, err
+	}
+
+	// Check arguments
+	if len(req.VolumeId) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID cannot be empty")
+	}
+	if len(req.MutableParameters) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Mutable parameters cannot be empty")
+	}
+
+	// Check if the mutable parameters are in the accepted list
+	if err := hp.validateVolumeMutableParameters(req.MutableParameters); err != nil {
+		return nil, err
+	}
+
+	// Lock before acting on global state. A production-quality
+	// driver might use more fine-grained locking.
+	hp.mutex.Lock()
+	defer hp.mutex.Unlock()
+
+	// Get the volume
+	_, err := hp.state.GetVolumeByID(req.VolumeId)
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+
+	return &csi.ControllerModifyVolumeResponse{}, nil
+}
+
 // CreateSnapshot uses tar command to create snapshot for hostpath volume. The tar command can quickly create
 // archives of entire directories. The host image must have "tar" binaries in /bin, /usr/sbin, or /usr/bin.
 func (hp *hostPath) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT); err != nil {
-		glog.V(3).Infof("invalid create snapshot req: %v", req)
+		klog.V(3).Infof("invalid create snapshot req: %v", req)
 		return nil, err
 	}
 
@@ -542,25 +596,18 @@ func (hp *hostPath) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotR
 	}
 
 	snapshotID := uuid.NewUUID().String()
-	creationTime := ptypes.TimestampNow()
-	volPath := hostPathVolume.VolPath
+	creationTime := timestamppb.Now()
 	file := hp.getSnapshotPath(snapshotID)
-
-	var cmd []string
-	if hostPathVolume.VolAccessType == state.BlockAccess {
-		glog.V(4).Infof("Creating snapshot of Raw Block Mode Volume")
-		cmd = []string{"cp", volPath, file}
-	} else {
-		glog.V(4).Infof("Creating snapshot of Filsystem Mode Volume")
-		cmd = []string{"tar", "czf", file, "-C", volPath, "."}
-	}
-	executor := utilexec.New()
-	out, err := executor.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	opts, err := optionsFromParameters(hostPathVolume, req.Parameters)
 	if err != nil {
-		return nil, fmt.Errorf("failed create snapshot: %w: %s", err, out)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid volume snapshot class parameters: %s", err.Error())
 	}
 
-	glog.V(4).Infof("create volume snapshot %s", file)
+	if err := hp.createSnapshotFromVolume(hostPathVolume, file, opts...); err != nil {
+		return nil, err
+	}
+
+	klog.V(4).Infof("create volume snapshot %s", file)
 	snapshot := state.Snapshot{}
 	snapshot.Name = req.GetName()
 	snapshot.Id = snapshotID
@@ -591,7 +638,7 @@ func (hp *hostPath) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotR
 	}
 
 	if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT); err != nil {
-		glog.V(3).Infof("invalid delete snapshot req: %v", req)
+		klog.V(3).Infof("invalid delete snapshot req: %v", req)
 		return nil, err
 	}
 	snapshotID := req.GetSnapshotId()
@@ -601,7 +648,12 @@ func (hp *hostPath) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotR
 	hp.mutex.Lock()
 	defer hp.mutex.Unlock()
 
-	glog.V(4).Infof("deleting snapshot %s", snapshotID)
+	// If the snapshot has a GroupSnapshotID, deletion is not allowed and should return InvalidArgument.
+	if snapshot, err := hp.state.GetSnapshotByID(snapshotID); err != nil && snapshot.GroupSnapshotID != "" {
+		return nil, status.Errorf(codes.InvalidArgument, "Snapshot with ID %s is part of groupsnapshot %s", snapshotID, snapshot.GroupSnapshotID)
+	}
+
+	klog.V(4).Infof("deleting snapshot %s", snapshotID)
 	path := hp.getSnapshotPath(snapshotID)
 	os.RemoveAll(path)
 	if err := hp.state.DeleteSnapshot(snapshotID); err != nil {
@@ -612,7 +664,7 @@ func (hp *hostPath) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotR
 
 func (hp *hostPath) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	if err := hp.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS); err != nil {
-		glog.V(3).Infof("invalid list snapshot req: %v", req)
+		klog.V(3).Infof("invalid list snapshot req: %v", req)
 		return nil, err
 	}
 
@@ -642,7 +694,7 @@ func (hp *hostPath) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 		return &csi.ListSnapshotsResponse{}, nil
 	}
 
-	var snapshots []csi.Snapshot
+	var snapshots []*csi.Snapshot
 	// case 3: no parameter is set, so we return all the snapshots.
 	hpSnapshots := hp.state.GetSnapshots()
 	sort.Slice(hpSnapshots, func(i, j int) bool {
@@ -650,12 +702,13 @@ func (hp *hostPath) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 	})
 
 	for _, snap := range hpSnapshots {
-		snapshot := csi.Snapshot{
-			SnapshotId:     snap.Id,
-			SourceVolumeId: snap.VolID,
-			CreationTime:   snap.CreationTime,
-			SizeBytes:      snap.SizeBytes,
-			ReadyToUse:     snap.ReadyToUse,
+		snapshot := &csi.Snapshot{
+			SnapshotId:      snap.Id,
+			SourceVolumeId:  snap.VolID,
+			CreationTime:    snap.CreationTime,
+			SizeBytes:       snap.SizeBytes,
+			ReadyToUse:      snap.ReadyToUse,
+			GroupSnapshotId: snap.GroupSnapshotID,
 		}
 		snapshots = append(snapshots, snapshot)
 	}
@@ -704,7 +757,7 @@ func (hp *hostPath) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReq
 
 	for i = 0; i < len(entries); i++ {
 		entries[i] = &csi.ListSnapshotsResponse_Entry{
-			Snapshot: &snapshots[j],
+			Snapshot: snapshots[j],
 		}
 		j++
 	}
@@ -759,7 +812,7 @@ func (hp *hostPath) ControllerExpandVolume(ctx context.Context, req *csi.Control
 
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         exVol.VolSize,
-		NodeExpansionRequired: true,
+		NodeExpansionRequired: !hp.config.DisableNodeExpansion,
 	}, nil
 }
 
@@ -767,11 +820,12 @@ func convertSnapshot(snap state.Snapshot) *csi.ListSnapshotsResponse {
 	entries := []*csi.ListSnapshotsResponse_Entry{
 		{
 			Snapshot: &csi.Snapshot{
-				SnapshotId:     snap.Id,
-				SourceVolumeId: snap.VolID,
-				CreationTime:   snap.CreationTime,
-				SizeBytes:      snap.SizeBytes,
-				ReadyToUse:     snap.ReadyToUse,
+				SnapshotId:      snap.Id,
+				SourceVolumeId:  snap.VolID,
+				CreationTime:    snap.CreationTime,
+				SizeBytes:       snap.SizeBytes,
+				ReadyToUse:      snap.ReadyToUse,
+				GroupSnapshotId: snap.GroupSnapshotID,
 			},
 		},
 	}
@@ -781,6 +835,25 @@ func convertSnapshot(snap state.Snapshot) *csi.ListSnapshotsResponse {
 	}
 
 	return rsp
+}
+
+// validateVolumeMutableParameters is a helper function to check if the mutable parameters are in the accepted list
+func (hp *hostPath) validateVolumeMutableParameters(params map[string]string) error {
+	if len(hp.config.AcceptedMutableParameterNames) == 0 {
+		return nil
+	}
+
+	accepts := sets.New(hp.config.AcceptedMutableParameterNames...)
+	unsupported := []string{}
+	for k := range params {
+		if !accepts.Has(k) {
+			unsupported = append(unsupported, k)
+		}
+	}
+	if len(unsupported) > 0 {
+		return status.Errorf(codes.InvalidArgument, "invalid parameters: %v", unsupported)
+	}
+	return nil
 }
 
 func (hp *hostPath) validateControllerServiceRequest(c csi.ControllerServiceCapability_RPC_Type) error {
@@ -804,7 +877,6 @@ func (hp *hostPath) getControllerServiceCapabilities() []*csi.ControllerServiceC
 			csi.ControllerServiceCapability_RPC_GET_VOLUME,
 			csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-			csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 			csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 			csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 			csi.ControllerServiceCapability_RPC_VOLUME_CONDITION,
@@ -815,6 +887,12 @@ func (hp *hostPath) getControllerServiceCapabilities() []*csi.ControllerServiceC
 		}
 		if hp.config.EnableAttach {
 			cl = append(cl, csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME)
+		}
+		if hp.config.EnableControllerModifyVolume {
+			cl = append(cl, csi.ControllerServiceCapability_RPC_MODIFY_VOLUME)
+		}
+		if hp.config.EnableListSnapshots {
+			cl = append(cl, csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS)
 		}
 	}
 
